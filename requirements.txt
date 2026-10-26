@@ -1,7 +1,5 @@
 
 streamlit
-json-repair
 PyMuPDF
 python-docx
 python-pptx
-openai
