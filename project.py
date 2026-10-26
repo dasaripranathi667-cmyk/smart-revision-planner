@@ -1,4 +1,3 @@
-from json_repair import loads as repair_json_loads
 import streamlit as st
 import streamlit.components.v1 as components
 import sqlite3
@@ -7,6 +6,7 @@ import base64
 import json
 import os
 import random
+import re
 import datetime
 import io
 import shutil
@@ -15,7 +15,6 @@ import tempfile
 from pathlib import Path
 from docx import Document
 from pptx import Presentation
-from openai import OpenAI
 
 DB = "smart_revision_planner.db"
 TODAY = datetime.date.today()
@@ -504,115 +503,114 @@ def get_all_strengths():
 
 
 # ==================================================
-# AI QUIZ GENERATION
+# SIMPLE LOCAL QUIZ GENERATION (NO API KEY REQUIRED)
 # ==================================================
 
 def generate_questions(source_text, count=20):
-    """Generate multiple-choice questions from study material using Groq."""
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        try:
-            api_key = st.secrets.get("GROQ_API_KEY", "")
-        except Exception:
-            api_key = ""
-
-    if not api_key:
-        raise ValueError(
-            "GROQ_API_KEY is not available to this Streamlit process. "
-            "Set it in the same terminal before starting Streamlit, then restart the app."
-        )
-
+    """Create basic fill-in-the-blank MCQs from extracted study text locally."""
     if not source_text or not source_text.strip():
         raise ValueError(
             "No readable text was extracted from the selected material. "
             "Try a text-based PDF/PPT/DOC file; scanned files need OCR."
         )
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.groq.com/openai/v1",
-        timeout=120.0,
-        max_retries=2,
-    )
+    stop_words = {
+        "about", "above", "after", "again", "against", "being", "below",
+        "between", "could", "does", "doing", "during", "each", "from",
+        "have", "having", "into", "itself", "more", "most", "other",
+        "over", "same", "should", "some", "such", "than", "that", "their",
+        "there", "these", "they", "this", "those", "through", "under",
+        "until", "very", "what", "when", "where", "which", "while",
+        "with", "would", "your", "also", "because", "been", "were",
+        "will", "shall", "must", "using", "used", "uses", "whose",
+        "then", "them", "only", "both", "many", "much", "make", "made",
+        "like", "into", "upon", "whereas", "however", "therefore", "figure",
+        "table", "page", "slide", "document", "material", "chapter"
+    }
 
-    prompt = f"""Create exactly {count} distinct multiple-choice study questions using ONLY the study material below.
-Requirements:
-- Cover different concepts throughout the material.
-- Mix basic, intermediate, and challenging questions.
-- Provide four options labelled A, B, C, and D.
-- Include exactly one correct answer per question.
-- Include a short explanation for each answer.
-- Do not invent facts absent from the material and avoid duplicates.
-Return ONLY valid JSON, without Markdown fences, in this format:
-{{"questions":[{{"question":"Question text","options":{{"A":"Option A","B":"Option B","C":"Option C","D":"Option D"}},"answer":"A","explanation":"Explanation"}}]}}
+    # Split text into reasonably sized sentence-like pieces, ignoring page/slide labels.
+    cleaned = re.sub(r"---\s*(Page|Slide)\s+\d+\s*---", " ", source_text, flags=re.I)
+    pieces = re.split(r"(?<=[.!?])\s+|[\r\n]+", cleaned)
+    sentences = []
+    for piece in pieces:
+        piece = re.sub(r"\s+", " ", piece).strip(" \t-•")
+        words = re.findall(r"\b[A-Za-z][A-Za-z'-]{3,}\b", piece)
+        if len(words) >= 5 and len(piece) >= 35:
+            sentences.append((piece, words))
 
-STUDY MATERIAL:
-{source_text[:100000]}"""
-
-    try:
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=12000,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Groq API request failed: {exc}") from exc
-
-    raw = (response.choices[0].message.content or "").strip()
-    finish_reason = response.choices[0].finish_reason
-    print("Groq response received; characters:", len(raw), "finish reason:", finish_reason)
-
-    if not raw:
+    if not sentences:
         raise ValueError(
-            f"Groq returned an empty response (finish reason: {finish_reason}). "
-            "Please try again or use a smaller amount of study material."
+            "Not enough readable text to create a quiz. Select a material with more text."
         )
 
-    raw = raw.removeprefix("```json").removeprefix("```").strip()
-    raw = raw.removesuffix("```").strip()
-    first = raw.find("{")
-    last = raw.rfind("}")
-    
-    if first < 0 or last < first:
-        raise ValueError("Groq did not return a JSON object. Try generating the quiz again.")
+    # Candidate terms come from the actual material, so the quiz works offline.
+    term_counts = {}
+    original_terms = {}
+    for sentence, words in sentences:
+        for word in words:
+            key = word.lower().strip("'-")
+            if len(key) >= 5 and key not in stop_words and not key.isdigit():
+                term_counts[key] = term_counts.get(key, 0) + 1
+                original_terms.setdefault(key, word.strip("'-"))
 
-    try:
-        data = json.loads(raw[first:last + 1])
-    except json.JSONDecodeError:
-        try:
-            data = repair_json_loads(raw[first:last + 1])
-        except Exception as exc:
-            raise ValueError(
-                "Groq returned invalid quiz data. Please try generating "
-                "the quiz again."
-            ) from exc
-
-    if not isinstance(data, dict):
-        raise ValueError("The AI returned an invalid quiz response.")
-
-    questions = data.get("questions", [])
-    if not isinstance(questions, list):
-        raise ValueError("The AI returned an invalid question list.")
-    if len(questions) != count:
+    terms = list(term_counts)
+    if len(terms) < 4:
         raise ValueError(
-            f"The AI returned {len(questions)} questions instead of {count}. "
-            "Please generate another batch."
+            "There are not enough distinct key words in this material to make multiple-choice questions."
         )
 
+    # Prefer terms that occur more than once, but allow other terms too.
+    candidates = []
+    for sentence, words in sentences:
+        local_keys = {w.lower().strip("'-") for w in words}
+        possible = [
+            w.lower().strip("'-") for w in words
+            if len(w.strip("'-")) >= 5
+            and w.lower().strip("'-") not in stop_words
+            and w.lower().strip("'-") in term_counts
+        ]
+        possible = list(dict.fromkeys(possible))
+        possible.sort(key=lambda k: (term_counts.get(k, 0), len(k)), reverse=True)
+        for target in possible[:3]:
+            candidates.append((sentence, target, local_keys))
 
-    for index, question in enumerate(questions, start=1):
-        if not isinstance(question, dict):
-            raise ValueError(f"Question {index} has an invalid format.")
-        options = question.get("options")
-        if (
-            not question.get("question")
-            or not isinstance(options, dict)
-            or set(options.keys()) != {"A", "B", "C", "D"}
-            or question.get("answer") not in {"A", "B", "C", "D"}
-            or not question.get("explanation")
-        ):
-            raise ValueError(f"Question {index} has an invalid format.")
+    random.shuffle(candidates)
+    questions = []
+    seen = set()
+    for sentence, target, local_keys in candidates:
+        if len(questions) >= count:
+            break
+        question_text = re.sub(
+            rf"\b{re.escape(target)}\b", "________", sentence, count=1, flags=re.I
+        )
+        if "________" not in question_text:
+            continue
+        signature = (question_text.lower(), target)
+        if signature in seen:
+            continue
+        seen.add(signature)
+
+        distractors = [t for t in terms if t != target and t not in local_keys]
+        random.shuffle(distractors)
+        distractors = distractors[:3]
+        if len(distractors) < 3:
+            distractors = [t for t in terms if t != target][:3]
+        if len(distractors) < 3:
+            continue
+
+        choices = [target] + distractors
+        random.shuffle(choices)
+        options = {letter: original_terms.get(word, word) for letter, word in zip("ABCD", choices)}
+        answer = next(letter for letter, word in zip("ABCD", choices) if word == target)
+        questions.append({
+            "question": f"Choose the word that best completes the sentence: {question_text}",
+            "options": options,
+            "answer": answer,
+            "explanation": f"From the selected study material: {sentence}"
+        })
+
+    if not questions:
+        raise ValueError("Could not create questions from this text. Try another material.")
 
     return questions
 
@@ -995,7 +993,7 @@ elif page == "Study Material Reader":
 # ==================================================
 
 elif page == "Quiz Centre":
-    st.title("🧠 AI Quiz Centre")
+    st.title("🧠 Quiz Centre")
 
     pdfs = get_pdfs()
     subjects = get_subjects()
@@ -1068,7 +1066,7 @@ elif page == "Quiz Centre":
             for p in source_pdfs:
                 st.write(f"- {p['subject_name']} / {p['name']}")
 
-    if st.button("✨ Generate 20 New Questions", type="primary"):
+    if st.button("✨ Generate Up to 20 Questions", type="primary"):
         if not source_pdfs:
             st.warning("Select at least one study material.")
         else:
@@ -1085,7 +1083,7 @@ elif page == "Quiz Centre":
 
                 combined_text = combined_text[:100000]
 
-                with st.spinner("Generating a new quiz batch..."):
+                with st.spinner("Creating questions from your study material..."):
                     questions = generate_questions(combined_text, 20)
 
                 with connect() as conn:
@@ -1105,15 +1103,12 @@ elif page == "Quiz Centre":
                     batch_id = cur.lastrowid
 
                 st.session_state["active_quiz_id"] = batch_id
-                st.success("New batch created. Your previous batches are preserved.")
+                st.success(f"Created {len(questions)} questions. Your previous batches are preserved.")
                 st.rerun()
 
             except Exception as e:
                 st.error(f"Quiz generation failed: {e}")
-                st.info(
-                    "This quiz uses Groq. Check the detailed error above; "
-                    "also confirm the selected files contain readable text."
-                )
+                st.info("Check that the selected material contains readable text. This quiz generator works locally and does not need an API key.")
 
     st.divider()
     st.subheader("🗂️ Previous Quiz Batches")
